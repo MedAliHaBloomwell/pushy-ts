@@ -1,0 +1,80 @@
+{
+  "name": "pushy-ts",
+  "version": "0.1.0",
+  "description": "A TypeScript port of Pushy: an HTTP/2 Apple Push Notification service (APNs) client for Bun and Node.js, with zero runtime dependencies.",
+  "keywords": [
+    "apns",
+    "apple",
+    "push",
+    "push-notifications",
+    "ios",
+    "http2",
+    "bun",
+    "node",
+    "pushy"
+  ],
+  "license": "MIT",
+  "author": "MedAliHaBloomwell",
+  "contributors": [
+    "Jon Chambers (original Pushy for Java, https://github.com/jchambers/pushy)"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MedAliHaBloomwell/pushy-ts.git"
+  },
+  "homepage": "https://github.com/MedAliHaBloomwell/pushy-ts#readme",
+  "bugs": {
+    "url": "https://github.com/MedAliHaBloomwell/pushy-ts/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "import": {
+        "types": [
+          "./dist/index.d.ts",
+          "./src/index.ts"
+        ],
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": [
+          "./dist/index.d.cts",
+          "./src/index.ts"
+        ],
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.0.0",
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepare": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:node": "npm run build && node --test test/node/esm.e2e.mjs test/node/cjs.e2e.cjs",
+    "check": "bun run typecheck && bun test && bun run test:node",
+    "gen:test-certs": "./scripts/gen-test-certs.sh",
+    "prepublishOnly": "bun run check"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0"
+  }
+}
