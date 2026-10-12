@@ -54,15 +54,48 @@ export interface ValidatingPushNotificationHandlerFactoryOptions {
   deviceTokensByTopic?: StringSetMap | undefined;
   /** Device tokens that are no longer registered, with the time they stopped being valid. */
   expirationTimestampsByDeviceToken?: DateMap | undefined;
-  /** For token-based authentication: the keys whose tokens the server accepts, and the topics each key may use. */
-  verificationKeys?: Array<{ key: ApnsVerificationKey; topics: Iterable<string> }>;
+  /**
+   * For token-based authentication: the keys whose tokens the server accepts, and the topics each key may use. A
+   * bundle ID also covers its push type topics, such as `<bundle ID>.push-type.liveactivity` and `<bundle ID>.voip`.
+   */
+  verificationKeys?: Array<{ key: ApnsVerificationKey; topics: Iterable<string> }> | undefined;
+  /**
+   * Broadcast channels (Live Activities, iOS 18+) that accept broadcasts. With a storage policy of
+   * `MessageStoragePolicy.NO_MESSAGE_STORED` (0), broadcasts with a nonzero expiration are rejected, as on APNs.
+   */
+  broadcastChannels?: Array<{ bundleId: string; channelId: string; messageStoragePolicy?: 0 | 1 | undefined }> | undefined;
 }
 
 const APNS_PATH_PREFIX = "/3/device/";
+const BROADCAST_PATH_PREFIX = "/4/broadcasts/apps/";
 const DEVICE_TOKEN_PATTERN = /^[0-9a-fA-F]{64}$/;
 const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 const MAX_PAYLOAD_SIZE = 4096;
+const MAX_VOIP_PAYLOAD_SIZE = 5120;
+const MAX_BROADCAST_PAYLOAD_SIZE = 5120;
 const MAX_COLLAPSE_ID_SIZE = 64;
+
+/** Topic suffixes Apple uses for push types; a bundle ID authorizes each of them. */
+const TOPIC_SUFFIXES = [
+  ".push-type.liveactivity",
+  ".push-type.widgets",
+  ".push-type.controls",
+  ".push-type.accessory",
+  ".pushkit.fileprovider",
+  ".location-query",
+  ".complication",
+  ".voip-ptt",
+  ".voip",
+];
+
+/** The bundle ID a topic belongs to, e.g. `com.example.app` for `com.example.app.push-type.liveactivity`. */
+function baseTopic(topic: string): string {
+  const suffix = TOPIC_SUFFIXES.find((candidate) => topic.endsWith(candidate));
+  return suffix ? topic.slice(0, -suffix.length) : topic;
+}
+
+type BroadcastChannels = Map<string, Map<string, 0 | 1 | undefined>>;
 const AUTHENTICATION_TOKEN_EXPIRATION_MS = 60 * 60_000;
 
 const VALID_PRIORITIES = new Set<number>(Object.values(DeliveryPriority));
@@ -86,9 +119,16 @@ abstract class ValidatingPushNotificationHandler implements PushNotificationHand
   constructor(
     private readonly deviceTokensByTopic: Map<string, Set<string>>,
     private readonly expirationTimestampsByDeviceToken: Map<string, Date>,
+    private readonly broadcastChannels: BroadcastChannels,
   ) {}
 
   handlePushNotification(headers: IncomingHttpHeaders, payload: Buffer): void {
+    const path = header(headers, ":path");
+    if (path?.startsWith(BROADCAST_PATH_PREFIX)) {
+      this.handleBroadcast(headers, path.slice(BROADCAST_PATH_PREFIX.length), payload);
+      return;
+    }
+
     const apnsId = header(headers, "apns-id");
     if (apnsId !== undefined && !UUID_PATTERN.test(apnsId)) {
       throw new RejectedNotificationError(RejectionReason.BAD_MESSAGE_ID);
@@ -118,7 +158,6 @@ abstract class ValidatingPushNotificationHandler implements PushNotificationHand
       throw new RejectedNotificationError(RejectionReason.INVALID_PUSH_TYPE);
     }
 
-    const path = header(headers, ":path");
     if (path === APNS_PATH_PREFIX) {
       throw new RejectedNotificationError(RejectionReason.MISSING_DEVICE_TOKEN);
     } else if (path?.startsWith(APNS_PATH_PREFIX)) {
@@ -132,24 +171,98 @@ abstract class ValidatingPushNotificationHandler implements PushNotificationHand
         throw new UnregisteredDeviceTokenError(expirationTimestamp);
       }
 
-      if (!this.deviceTokensByTopic.get(topic)?.has(deviceToken)) {
+      const registered =
+        this.deviceTokensByTopic.get(topic)?.has(deviceToken) ||
+        this.deviceTokensByTopic.get(baseTopic(topic))?.has(deviceToken);
+      if (!registered) {
         throw new RejectedNotificationError(RejectionReason.DEVICE_TOKEN_NOT_FOR_TOPIC);
       }
     } else {
       throw new RejectedNotificationError(RejectionReason.BAD_PATH);
     }
 
-    this.verifyAuthentication(headers);
+    this.verifyAuthentication(headers, topic, null);
 
     if (payload.length === 0) {
       throw new RejectedNotificationError(RejectionReason.PAYLOAD_EMPTY);
     }
-    if (payload.length > MAX_PAYLOAD_SIZE) {
+    if (payload.length > (pushType === PushType.VOIP ? MAX_VOIP_PAYLOAD_SIZE : MAX_PAYLOAD_SIZE)) {
       throw new RejectedNotificationError(RejectionReason.PAYLOAD_TOO_LARGE);
     }
   }
 
-  protected abstract verifyAuthentication(headers: IncomingHttpHeaders): void;
+  /** Validates a broadcast the way APNs does: headers first, then authentication, then the channel. */
+  private handleBroadcast(headers: IncomingHttpHeaders, bundleId: string, payload: Buffer): void {
+    const requestId = header(headers, "apns-request-id");
+    if (requestId !== undefined && !UUID_PATTERN.test(requestId)) {
+      throw new RejectedNotificationError(RejectionReason.BAD_MESSAGE_ID);
+    }
+
+    if (header(headers, ":method") !== "POST") {
+      throw new RejectedNotificationError(RejectionReason.METHOD_NOT_ALLOWED);
+    }
+
+    if (bundleId.length === 0 || bundleId.includes("/")) {
+      throw new RejectedNotificationError(RejectionReason.BAD_PATH);
+    }
+    if (baseTopic(bundleId) !== bundleId) {
+      throw new RejectedNotificationError(RejectionReason.TOPIC_DISALLOWED);
+    }
+
+    const pushType = header(headers, "apns-push-type");
+    if (pushType === undefined) {
+      throw new RejectedNotificationError(RejectionReason.MISSING_PUSH_TYPE);
+    }
+    if (pushType.toLowerCase() !== PushType.LIVE_ACTIVITY) {
+      throw new RejectedNotificationError(RejectionReason.INVALID_PUSH_TYPE);
+    }
+
+    const channelId = header(headers, "apns-channel-id");
+    if (channelId === undefined) {
+      throw new RejectedNotificationError(RejectionReason.MISSING_CHANNEL_ID);
+    }
+    if (!BASE64_PATTERN.test(channelId)) {
+      throw new RejectedNotificationError(RejectionReason.BAD_CHANNEL_ID);
+    }
+
+    const expiration = header(headers, "apns-expiration");
+    if (expiration !== undefined && !/^\d+$/.test(expiration)) {
+      throw new RejectedNotificationError(RejectionReason.BAD_EXPIRATION_DATE);
+    }
+
+    const priority = header(headers, "apns-priority");
+    if (priority !== undefined && !VALID_PRIORITIES.has(Number(priority))) {
+      throw new RejectedNotificationError(RejectionReason.BAD_PRIORITY);
+    }
+
+    this.verifyAuthentication(headers, bundleId, RejectionReason.TOPIC_MISMATCH);
+
+    const channels = this.broadcastChannels.get(bundleId);
+    if (!channels?.has(channelId)) {
+      throw new RejectedNotificationError(RejectionReason.CHANNEL_NOT_REGISTERED);
+    }
+    if (channels.get(channelId) === 0 && expiration !== undefined && expiration !== "0") {
+      throw new RejectedNotificationError(RejectionReason.BAD_EXPIRATION_DATE);
+    }
+
+    if (payload.length === 0) {
+      throw new RejectedNotificationError(RejectionReason.PAYLOAD_EMPTY);
+    }
+    if (payload.length > MAX_BROADCAST_PAYLOAD_SIZE) {
+      throw new RejectedNotificationError(RejectionReason.PAYLOAD_TOO_LARGE);
+    }
+  }
+
+  /**
+   * Checks the request's credentials and that they cover `topic`.
+   *
+   * @param topicMismatch the rejection for credentials that don't cover the topic, or `null` for the handler's default
+   */
+  protected abstract verifyAuthentication(
+    headers: IncomingHttpHeaders,
+    topic: string,
+    topicMismatch: RejectionReason | null,
+  ): void;
 }
 
 class TlsAuthenticationValidatingPushNotificationHandler extends ValidatingPushNotificationHandler {
@@ -158,16 +271,20 @@ class TlsAuthenticationValidatingPushNotificationHandler extends ValidatingPushN
   constructor(
     deviceTokensByTopic: Map<string, Set<string>>,
     expirationTimestampsByDeviceToken: Map<string, Date>,
-    baseTopic: string,
+    broadcastChannels: BroadcastChannels,
+    certificateTopic: string,
   ) {
-    super(deviceTokensByTopic, expirationTimestampsByDeviceToken);
-    this.allowedTopics = new Set([baseTopic, `${baseTopic}.voip`, `${baseTopic}.complication`]);
+    super(deviceTokensByTopic, expirationTimestampsByDeviceToken, broadcastChannels);
+    this.allowedTopics = new Set([certificateTopic, `${certificateTopic}.voip`, `${certificateTopic}.complication`]);
   }
 
-  protected verifyAuthentication(headers: IncomingHttpHeaders): void {
-    const topic = header(headers, "apns-topic");
-    if (topic === undefined || !this.allowedTopics.has(topic)) {
-      throw new RejectedNotificationError(RejectionReason.BAD_TOPIC);
+  protected verifyAuthentication(
+    _headers: IncomingHttpHeaders,
+    topic: string,
+    topicMismatch: RejectionReason | null,
+  ): void {
+    if (!this.allowedTopics.has(topic)) {
+      throw new RejectedNotificationError(topicMismatch ?? RejectionReason.BAD_TOPIC);
     }
   }
 }
@@ -178,13 +295,18 @@ class TokenAuthenticationValidatingPushNotificationHandler extends ValidatingPus
   constructor(
     deviceTokensByTopic: Map<string, Set<string>>,
     expirationTimestampsByDeviceToken: Map<string, Date>,
+    broadcastChannels: BroadcastChannels,
     private readonly verificationKeysByKeyId: Map<string, ApnsVerificationKey>,
     private readonly topicsByVerificationKey: Map<ApnsVerificationKey, Set<string>>,
   ) {
-    super(deviceTokensByTopic, expirationTimestampsByDeviceToken);
+    super(deviceTokensByTopic, expirationTimestampsByDeviceToken, broadcastChannels);
   }
 
-  protected verifyAuthentication(headers: IncomingHttpHeaders): void {
+  protected verifyAuthentication(
+    headers: IncomingHttpHeaders,
+    topic: string,
+    topicMismatch: RejectionReason | null,
+  ): void {
     const authorization = header(headers, "authorization");
     if (authorization === undefined || !authorization.startsWith("bearer")) {
       throw new RejectedNotificationError(RejectionReason.MISSING_PROVIDER_TOKEN);
@@ -216,12 +338,9 @@ class TokenAuthenticationValidatingPushNotificationHandler extends ValidatingPus
       throw new RejectedNotificationError(RejectionReason.EXPIRED_PROVIDER_TOKEN);
     }
 
-    const topic = header(headers, "apns-topic");
-    if (topic === undefined) {
-      throw new RejectedNotificationError(RejectionReason.MISSING_TOPIC);
-    }
-    if (!this.topicsByVerificationKey.get(verificationKey)?.has(topic)) {
-      throw new RejectedNotificationError(RejectionReason.INVALID_PROVIDER_TOKEN);
+    const allowedTopics = this.topicsByVerificationKey.get(verificationKey);
+    if (!allowedTopics?.has(topic) && !allowedTopics?.has(baseTopic(topic))) {
+      throw new RejectedNotificationError(topicMismatch ?? RejectionReason.INVALID_PROVIDER_TOKEN);
     }
   }
 }
@@ -237,10 +356,17 @@ export class ValidatingPushNotificationHandlerFactory implements PushNotificatio
   private readonly expirationTimestampsByDeviceToken: Map<string, Date>;
   private readonly verificationKeysByKeyId = new Map<string, ApnsVerificationKey>();
   private readonly topicsByVerificationKey = new Map<ApnsVerificationKey, Set<string>>();
+  private readonly broadcastChannels: BroadcastChannels = new Map();
 
   constructor(options: ValidatingPushNotificationHandlerFactoryOptions = {}) {
     this.deviceTokensByTopic = toStringSetMap(options.deviceTokensByTopic);
     this.expirationTimestampsByDeviceToken = toDateMap(options.expirationTimestampsByDeviceToken);
+
+    for (const { bundleId, channelId, messageStoragePolicy } of options.broadcastChannels ?? []) {
+      const channels = this.broadcastChannels.get(bundleId) ?? new Map<string, 0 | 1 | undefined>();
+      channels.set(channelId, messageStoragePolicy);
+      this.broadcastChannels.set(bundleId, channels);
+    }
 
     for (const { key, topics } of options.verificationKeys ?? []) {
       this.verificationKeysByKeyId.set(key.keyId, key);
@@ -250,20 +376,22 @@ export class ValidatingPushNotificationHandlerFactory implements PushNotificatio
 
   buildHandler(session: MockApnsSession): PushNotificationHandler {
     if (session.clientCertificate) {
-      const baseTopic = session.clientCertificate.subject?.["UID"];
-      if (typeof baseTopic !== "string" || baseTopic.length === 0) {
+      const certificateTopic = session.clientCertificate.subject?.["UID"];
+      if (typeof certificateTopic !== "string" || certificateTopic.length === 0) {
         throw new TypeError("Client certificate does not specify a base topic.");
       }
       return new TlsAuthenticationValidatingPushNotificationHandler(
         this.deviceTokensByTopic,
         this.expirationTimestampsByDeviceToken,
-        baseTopic,
+        this.broadcastChannels,
+        certificateTopic,
       );
     }
 
     return new TokenAuthenticationValidatingPushNotificationHandler(
       this.deviceTokensByTopic,
       this.expirationTimestampsByDeviceToken,
+      this.broadcastChannels,
       this.verificationKeysByKeyId,
       this.topicsByVerificationKey,
     );

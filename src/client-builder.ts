@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import type { ApnsSigningKey } from "./auth/signing-key";
 import { ApnsClient, type ApnsClientCredentials, type ApnsClientOptions } from "./client";
-import type { SocketFactory } from "./connection";
+import type { ApnsTlsOverridesProvider, SocketFactory } from "./connection";
 import { DEFAULT_APNS_PORT } from "./constants";
 import type { Logger } from "./logger";
 import type { ApnsClientMetricsListener } from "./metrics";
@@ -64,6 +64,15 @@ export class ApnsClientBuilder {
       typeof pemFileOrData === "string" && !pemFileOrData.includes("-----BEGIN")
         ? readFileSync(pemFileOrData)
         : pemFileOrData;
+    return this;
+  }
+
+  /**
+   * Sets extra `tls.connect` options (e.g. `ciphers`, `minVersion`, `secureContext`, or `lookup` for custom DNS), or a
+   * function that computes them for each new connection, e.g. to pick up rotated certificates.
+   */
+  setTlsOptions(tlsOptions: ApnsTlsOverridesProvider): this {
+    this.options.tlsOptions = tlsOptions;
     return this;
   }
 

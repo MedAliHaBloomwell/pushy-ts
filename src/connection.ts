@@ -5,7 +5,6 @@ import tls from "node:tls";
 import type { AuthenticationTokenProvider } from "./auth/token-provider";
 import { ApnsError, ConnectionTimeoutError, RefusedStreamError, StreamClosedBeforeReplyError } from "./errors";
 import type { Logger } from "./logger";
-import type { ApnsPushNotification, PushNotificationResponse } from "./notification";
 
 /**
  * Opens the raw (pre-TLS) socket to the APNs server, e.g. through a proxy. The connection wraps the returned socket in
@@ -16,10 +15,34 @@ export type SocketFactory = (host: string, port: number) => Promise<Duplex>;
 /** The TLS options a connection passes to `tls.connect`. */
 export type ApnsTlsOptions = Pick<tls.ConnectionOptions, "ca" | "cert" | "key" | "pfx" | "passphrase">;
 
+/**
+ * Extra options for `tls.connect`, e.g. `ciphers`, `minVersion`, `secureContext`, `ca`, or `lookup` (custom DNS
+ * resolution). Options that would weaken or break the connection (`rejectUnauthorized`, `checkServerIdentity`,
+ * `servername`, `ALPNProtocols`) and the connection target are controlled by the client and cannot be overridden.
+ */
+export type ApnsTlsOverrides = Omit<
+  tls.ConnectionOptions,
+  "host" | "port" | "path" | "socket" | "servername" | "ALPNProtocols" | "rejectUnauthorized" | "checkServerIdentity"
+>;
+
+/**
+ * Either fixed TLS overrides, or a function evaluated for every new connection. A function lets credentials or trusted
+ * certificates rotate without recreating the client: new connections pick up whatever the function returns.
+ */
+export type ApnsTlsOverridesProvider = ApnsTlsOverrides | (() => ApnsTlsOverrides | Promise<ApnsTlsOverrides>);
+
+/** A raw HTTP/2 response from an APNs server. */
+export interface ApnsRawResponse {
+  readonly statusCode: number;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: Buffer;
+}
+
 export interface ApnsConnectionOptions {
   host: string;
   port: number;
   tls: ApnsTlsOptions;
+  tlsOverrides: ApnsTlsOverridesProvider | undefined;
   hostnameVerification: boolean;
   connectionTimeoutMs: number | undefined;
   closeAfterIdleMs: number;
@@ -36,14 +59,29 @@ export class ConnectionNotUsableError extends ApnsError {
   }
 }
 
-const APNS_PATH_PREFIX = "/3/device/";
 const EXPIRED_PROVIDER_TOKEN_REASON = "ExpiredProviderToken";
 const { NGHTTP2_REFUSED_STREAM } = http2.constants;
 
-function headerValue(headers: IncomingHttpHeaders, name: string): string | null {
+/** Reads a response header as a single string. */
+export function headerValue(headers: IncomingHttpHeaders, name: string): string | null {
   const value = headers[name];
   if (Array.isArray(value)) return value[0] ?? null;
   return value ?? null;
+}
+
+/** Extracts `reason` and `timestamp` from an APNs error body; both are `null` if absent or unparseable. */
+export function parseErrorBody(body: Buffer): { reason: string | null; timestamp: Date | null; parsed: boolean } {
+  if (body.length === 0) return { reason: null, timestamp: null, parsed: false };
+  try {
+    const error = JSON.parse(body.toString("utf8")) as { reason?: unknown; timestamp?: unknown };
+    return {
+      reason: typeof error.reason === "string" ? error.reason : null,
+      timestamp: typeof error.timestamp === "number" ? new Date(error.timestamp) : null,
+      parsed: true,
+    };
+  } catch {
+    return { reason: null, timestamp: null, parsed: false };
+  }
 }
 
 /**
@@ -97,8 +135,7 @@ export class ApnsConnection {
     const { host, port, connectionTimeoutMs } = options;
     const authority = `https://${isIP(host) === 6 ? `[${host}]` : host}:${port}`;
 
-    const tlsOptions: tls.ConnectionOptions = {
-      ...options.tls,
+    const enforcedTlsOptions: tls.ConnectionOptions = {
       ...(isIP(host) === 0 ? { servername: host } : {}),
       rejectUnauthorized: true,
       ...(options.hostnameVerification ? {} : { checkServerIdentity: () => undefined }),
@@ -110,6 +147,10 @@ export class ApnsConnection {
     let abandoned = false;
 
     const attempt = (async () => {
+      const overrides =
+        typeof options.tlsOverrides === "function" ? await options.tlsOverrides() : (options.tlsOverrides ?? {});
+      const tlsOptions: tls.ConnectionOptions = { ...options.tls, ...overrides, ...enforcedTlsOptions };
+
       if (options.socketFactory) {
         rawSocket = await options.socketFactory(host, port);
         if (abandoned) {
@@ -209,26 +250,27 @@ export class ApnsConnection {
   }
 
   /**
-   * Sends a notification and resolves with the server's reply. Rejects if the stream closed before a reply arrived.
+   * Sends a request and resolves with the server's reply. Adds the provider token for token-based authentication.
+   * Rejects if the stream closed before a reply arrived.
    *
-   * @param onWritten called once the notification has been fully written to the connection
+   * @param body the request body, or `undefined` for requests without one
+   * @param onWritten called once the request has been fully written to the connection
    */
-  send<T extends ApnsPushNotification>(notification: T, onWritten?: () => void): Promise<PushNotificationResponse<T>> {
+  request(headers: OutgoingHttpHeaders, body: string | undefined, onWritten?: () => void): Promise<ApnsRawResponse> {
     if (!this.isUsable) {
       return Promise.reject(new ConnectionNotUsableError());
     }
 
     const { logger, tokenProvider } = this.options;
     const authenticationToken = tokenProvider?.getToken();
-    const headers = ApnsConnection.buildHeaders(notification);
-    if (authenticationToken) {
-      headers.authorization = authenticationToken.authorizationHeader;
-    }
+    const requestHeaders: OutgoingHttpHeaders = authenticationToken
+      ? { ...headers, authorization: authenticationToken.authorizationHeader }
+      : { ...headers };
 
     this.clearIdleTimer();
     this.inFlightCount++;
 
-    return new Promise<PushNotificationResponse<T>>((resolve, reject) => {
+    return new Promise<ApnsRawResponse>((resolve, reject) => {
       let settled = false;
       const settle = (complete: () => void) => {
         if (settled) return;
@@ -240,7 +282,7 @@ export class ApnsConnection {
 
       let stream: http2.ClientHttp2Stream;
       try {
-        stream = this.session.request(headers, { endStream: false });
+        stream = this.session.request(requestHeaders, { endStream: false });
       } catch (error) {
         settle(() => reject(this.isUsable ? error : new ConnectionNotUsableError()));
         return;
@@ -259,10 +301,18 @@ export class ApnsConnection {
       stream.on("end", () => {
         if (!responseHeaders) return;
 
-        const response = this.buildResponse(notification, responseHeaders, Buffer.concat(chunks));
+        const response: ApnsRawResponse = {
+          statusCode: Number(responseHeaders[":status"]),
+          headers: responseHeaders,
+          body: Buffer.concat(chunks),
+        };
         settle(() => resolve(response));
 
-        if (authenticationToken && response.rejectionReason === EXPIRED_PROVIDER_TOKEN_REASON) {
+        if (
+          authenticationToken &&
+          response.statusCode === 403 &&
+          parseErrorBody(response.body).reason === EXPIRED_PROVIDER_TOKEN_REASON
+        ) {
           // Once APNs considers a connection's token expired, it "wedges" the connection; the only way forward is a
           // new token on a new connection.
           logger.warn("APNs server reports the authentication token has expired; closing connection.");
@@ -284,7 +334,11 @@ export class ApnsConnection {
         }
       });
 
-      stream.end(notification.payload, "utf8", () => onWritten?.());
+      if (body === undefined) {
+        stream.end(() => onWritten?.());
+      } else {
+        stream.end(body, "utf8", () => onWritten?.());
+      }
     });
   }
 
@@ -333,74 +387,5 @@ export class ApnsConnection {
       clearTimeout(this.idleTimer);
       this.idleTimer = undefined;
     }
-  }
-
-  static buildHeaders(notification: ApnsPushNotification): OutgoingHttpHeaders {
-    const headers: OutgoingHttpHeaders = {
-      ":method": "POST",
-      ":path": APNS_PATH_PREFIX + notification.token,
-    };
-
-    const { expiration, collapseId, priority, pushType, topic, apnsId } = notification;
-
-    if (expiration === 0) {
-      headers["apns-expiration"] = "0";
-    } else if (expiration instanceof Date) {
-      headers["apns-expiration"] = String(Math.max(0, Math.floor(expiration.getTime() / 1000)));
-    }
-    if (collapseId != null) headers["apns-collapse-id"] = collapseId;
-    if (priority != null) headers["apns-priority"] = String(priority);
-    if (pushType != null) headers["apns-push-type"] = pushType;
-    if (topic != null) headers["apns-topic"] = topic;
-    if (apnsId != null) headers["apns-id"] = apnsId;
-
-    return headers;
-  }
-
-  private buildResponse<T extends ApnsPushNotification>(
-    notification: T,
-    headers: IncomingHttpHeaders,
-    body: Buffer,
-  ): PushNotificationResponse<T> {
-    const statusCode = Number(headers[":status"]);
-    const apnsId = headerValue(headers, "apns-id");
-    const apnsUniqueId = headerValue(headers, "apns-unique-id");
-
-    if (statusCode === 200) {
-      return {
-        pushNotification: notification,
-        accepted: true,
-        statusCode,
-        apnsId,
-        apnsUniqueId,
-        rejectionReason: null,
-        tokenInvalidationTimestamp: null,
-      };
-    }
-
-    let rejectionReason: string | null = null;
-    let tokenInvalidationTimestamp: Date | null = null;
-
-    if (body.length > 0) {
-      try {
-        const error = JSON.parse(body.toString("utf8")) as { reason?: unknown; timestamp?: unknown };
-        if (typeof error.reason === "string") rejectionReason = error.reason;
-        if (typeof error.timestamp === "number") tokenInvalidationTimestamp = new Date(error.timestamp);
-      } catch {
-        this.options.logger.error(`Failed to parse error response: ${body.toString("utf8")}`);
-      }
-    } else {
-      this.options.logger.warn("Gateway sent an end-of-stream HEADERS frame for an unsuccessful notification.");
-    }
-
-    return {
-      pushNotification: notification,
-      accepted: false,
-      statusCode,
-      apnsId,
-      apnsUniqueId,
-      rejectionReason,
-      tokenInvalidationTimestamp,
-    };
   }
 }

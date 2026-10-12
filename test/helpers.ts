@@ -9,6 +9,7 @@ import {
   ValidatingPushNotificationHandlerFactory,
   type ApnsClientOptions,
   type MockApnsServerOptions,
+  type ValidatingPushNotificationHandlerFactoryOptions,
 } from "../src";
 
 const fixtures = join(import.meta.dir, "fixtures");
@@ -29,12 +30,17 @@ export const verificationKey = ApnsVerificationKey.load(fixture("token-auth-publ
 export const PAYLOAD = JSON.stringify({ aps: { alert: "Hello" } });
 
 export function validatingHandlerFactory(
-  options: { deviceTokens?: string[]; expiredTokens?: Record<string, Date> } = {},
+  options: {
+    deviceTokens?: string[];
+    expiredTokens?: Record<string, Date>;
+    broadcastChannels?: ValidatingPushNotificationHandlerFactoryOptions["broadcastChannels"];
+  } = {},
 ) {
   return new ValidatingPushNotificationHandlerFactory({
     deviceTokensByTopic: { [TOPIC]: [DEVICE_TOKEN, ...(options.deviceTokens ?? [])] },
     expirationTimestampsByDeviceToken: options.expiredTokens ?? {},
     verificationKeys: [{ key: verificationKey, topics: [TOPIC] }],
+    broadcastChannels: options.broadcastChannels,
   });
 }
 

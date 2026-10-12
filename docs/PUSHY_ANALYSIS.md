@@ -89,6 +89,47 @@ notifications over each one, which is what Apple asks providers to do. The piece
   DNS resolver, the benchmark server, and the Dropwizard/Micrometer modules (the metrics listener interface is
   ported, so adapters are a few lines).
 
+## Live Activities (beyond Pushy)
+
+Pushy sends Live Activity notifications like any other (`liveactivity` push type, Live Activity keys in
+`ApnsPayloadBuilder`). pushy-ts adds the rest of Apple's spec, since Live Activities are its main use:
+
+- **`LiveActivityPushNotification`** sets `apns-push-type: liveactivity` and the `<bundle ID>.push-type.liveactivity`
+  topic, and only accepts priorities 5 and 10.
+- **`LiveActivityPayloadBuilder`** validates payloads against Apple's rules: `event` and `timestamp` always present;
+  starts need `attributes-type`, `attributes`, `content-state` and an alert; updates need `content-state`;
+  `dismissal-date` only on `end`; `input-push-token` / `input-push-channel` (iOS 18) only on `start`, and not both.
+  Alert `title`/`body` can be strings or `{"loc-key", "loc-args"}` objects.
+- **Broadcast push (iOS 18):** `ApnsClient.sendBroadcastNotification` posts to `/4/broadcasts/apps/<bundle ID>` with
+  `apns-channel-id`, `apns-expiration` (default 0) and `apns-priority`, and returns `apns-request-id` and
+  `apns-unique-id`. Payloads may be up to 5 KB.
+- **Channel management:** `ApnsChannelManagementClient` creates, reads, deletes and lists channels on
+  `api-manage-broadcast(.sandbox).push.apple.com` (ports 2196 / 2195). It shares the HTTP/2 pool, retry logic and
+  token authentication with `ApnsClient` through `ApnsHttp2Client`.
+- **Mock server:** validates broadcasts against registered channels (`broadcastChannels`), applies the 5 KB limit to
+  broadcasts and VoIP notifications, and accepts tokens for a bundle ID's suffixed topics.
+
+Sources: [ActivityKit push notifications](https://developer.apple.com/documentation/activitykit/starting-and-updating-live-activities-with-activitykit-push-notifications),
+[broadcast push notifications](https://developer.apple.com/documentation/usernotifications/sending-broadcast-push-notification-requests-to-apns),
+[channel management](https://developer.apple.com/documentation/usernotifications/sending-channel-management-requests-to-apns),
+[sending notification requests](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns).
+
+Apple's broadcast page lists `api.push.apple.com` / `api.sandbox.push.apple.com:443` as the broadcast hosts in its
+connection section, which pushy-ts follows; the host stays configurable if Apple changes it.
+
+## Upstream open issues
+
+Open issues on Pushy (checked 2026-10-12) and what they mean for pushy-ts:
+
+| Issue | Verdict | pushy-ts |
+| --- | --- | --- |
+| [#1112](https://github.com/jchambers/pushy/issues/1112) `title`/`body` objects in `aps.alert` | Valid | Fixed. Both payload builders write localized Live Activity alerts as `{"loc-key", "loc-args"}` objects. |
+| [#1081](https://github.com/jchambers/pushy/issues/1081) Broadcast push notifications | Valid | Implemented: `sendBroadcastNotification`, `ApnsChannelManagementClient`, `input-push-channel`, mock server validation. |
+| [#951](https://github.com/jchambers/pushy/issues/951) No way to customize the SSL context since 0.15.1 | Valid | `tlsOptions`: extra `tls.connect` options, static or computed per connection (e.g. rotated certificates). Certificate verification can't be turned off. |
+| [#1121](https://github.com/jchambers/pushy/issues/1121) Can't customize Netty's DNS resolver | Netty-specific | Not affected (no Netty). Custom DNS works through `tlsOptions.lookup` or `socketFactory`. |
+| [#1120](https://github.com/jchambers/pushy/issues/1120) Updating to Netty 4.2 | Java only | Not applicable. |
+| [#498](https://github.com/jchambers/pushy/issues/498) Publish a shaded JAR | Java only | Not applicable; pushy-ts has no runtime dependencies. |
+
 ## Runtime notes
 
 - **Bun's HTTP/2 client** behaves like Node's for everything pushy-ts needs, including mutual TLS, PKCS#12, ALPN,

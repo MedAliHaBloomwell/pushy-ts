@@ -25,6 +25,9 @@ const APS_KEY = "aps";
 
 const epochSeconds = (date: Date) => Math.floor(date.getTime() / 1000);
 
+const localizedText = (key: string, args: string[] | null) =>
+  args !== null ? { "loc-key": key, "loc-args": [...args] } : { "loc-key": key };
+
 /**
  * Builds APNs payloads (JSON strings) for push notifications. A port of Pushy's `ApnsPayloadBuilder`.
  *
@@ -66,6 +69,8 @@ export class ApnsPayloadBuilder {
   private attributesType: string | null = null;
   private attributes: JsonObject | null = null;
   private contentState: JsonObject | null = null;
+  private inputPushToken = false;
+  private inputPushChannel: string | null = null;
 
   /**
    * When `true`, an alert with nothing but a body is written as a plain string (`"alert": "body"`) rather than a
@@ -259,7 +264,29 @@ export class ApnsPayloadBuilder {
     return this;
   }
 
-  /** Sets the Live Activity event. Setting one makes this a Live Activity payload. */
+  /**
+   * For Live Activity `start` events (iOS 18+): asks the system to create an update push token for the new Live
+   * Activity (`"input-push-token": 1`).
+   */
+  setInputPushToken(inputPushToken: boolean): this {
+    this.inputPushToken = inputPushToken;
+    return this;
+  }
+
+  /**
+   * For Live Activity `start` events (iOS 18+): subscribes the new Live Activity to a broadcast channel
+   * (`"input-push-channel"`).
+   */
+  setInputPushChannel(channelId: string | null): this {
+    this.inputPushChannel = channelId;
+    return this;
+  }
+
+  /**
+   * Sets the Live Activity event. Setting one makes this a Live Activity payload: the sound moves into the alert, and
+   * localized titles and bodies are written as `{"loc-key", "loc-args"}` objects, as ActivityKit expects.
+   * `LiveActivityPayloadBuilder` is a stricter alternative for Live Activities.
+   */
   setEvent(event: LiveActivityEvent | null): this {
     this.event = event;
     return this;
@@ -318,6 +345,8 @@ export class ApnsPayloadBuilder {
     if (this.attributesType !== null) aps["attributes-type"] = this.attributesType;
     if (this.attributes !== null) aps["attributes"] = this.attributes;
     if (this.contentState !== null) aps["content-state"] = this.contentState;
+    if (this.inputPushToken) aps["input-push-token"] = 1;
+    if (this.inputPushChannel !== null) aps["input-push-channel"] = this.inputPushChannel;
     if (this.dismissalDate !== null) aps["dismissal-date"] = epochSeconds(this.dismissalDate);
     if (this.staleDate !== null) aps["stale-date"] = epochSeconds(this.staleDate);
 
@@ -336,13 +365,24 @@ export class ApnsPayloadBuilder {
       alert["action-loc-key"] = null;
     }
 
-    if (this.localizedAlertKey !== null) {
-      alert["loc-key"] = this.localizedAlertKey;
-      if (this.localizedAlertArguments !== null) alert["loc-args"] = [...this.localizedAlertArguments];
-    }
-    if (this.localizedAlertTitleKey !== null) {
-      alert["title-loc-key"] = this.localizedAlertTitleKey;
-      if (this.localizedAlertTitleArguments !== null) alert["title-loc-args"] = [...this.localizedAlertTitleArguments];
+    if (isLiveActivityPayload) {
+      // ActivityKit alerts localize the title and body with nested {"loc-key", "loc-args"} objects instead of the
+      // title-loc-key/loc-key siblings regular notifications use.
+      if (this.localizedAlertTitleKey !== null) {
+        alert["title"] = localizedText(this.localizedAlertTitleKey, this.localizedAlertTitleArguments);
+      }
+      if (this.localizedAlertKey !== null) {
+        alert["body"] = localizedText(this.localizedAlertKey, this.localizedAlertArguments);
+      }
+    } else {
+      if (this.localizedAlertKey !== null) {
+        alert["loc-key"] = this.localizedAlertKey;
+        if (this.localizedAlertArguments !== null) alert["loc-args"] = [...this.localizedAlertArguments];
+      }
+      if (this.localizedAlertTitleKey !== null) {
+        alert["title-loc-key"] = this.localizedAlertTitleKey;
+        if (this.localizedAlertTitleArguments !== null) alert["title-loc-args"] = [...this.localizedAlertTitleArguments];
+      }
     }
     if (this.localizedAlertSubtitleKey !== null) {
       alert["subtitle-loc-key"] = this.localizedAlertSubtitleKey;

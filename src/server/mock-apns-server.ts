@@ -47,7 +47,7 @@ export interface MockApnsServerOptions {
   maxConcurrentStreams?: number | undefined;
 }
 
-const MAX_CONTENT_LENGTH = 4096;
+const MAX_CONTENT_LENGTH = 5120;
 
 const toBuffer = (value: PemOrBytes) => (typeof value === "string" ? value : Buffer.from(value));
 
@@ -166,13 +166,20 @@ export class MockApnsServer {
     });
     stream.on("end", () => {
       const payload = Buffer.concat(chunks);
-      const requestApnsId = headers["apns-id"];
-      const apnsId = typeof requestApnsId === "string" ? requestApnsId : randomUUID();
+      // Broadcasts are identified by apns-request-id (and always get an apns-unique-id); device pushes by apns-id.
+      const isBroadcast = String(headers[":path"] ?? "").startsWith("/4/broadcasts/");
+      const idHeader = isBroadcast ? "apns-request-id" : "apns-id";
+      const requestId = headers[idHeader];
+      const id = typeof requestId === "string" ? requestId : randomUUID();
 
       void (async () => {
         try {
           await this.handlerFor(stream.session as Http2Session).handlePushNotification(headers, payload);
-          this.respond(stream, { ":status": 200, "apns-id": apnsId });
+          this.respond(stream, {
+            ":status": 200,
+            [idHeader]: id,
+            ...(isBroadcast ? { "apns-unique-id": randomUUID() } : {}),
+          });
           this.listener.handlePushNotificationAccepted?.(headers, payload);
         } catch (error) {
           const rejection =
@@ -181,7 +188,7 @@ export class MockApnsServer {
 
           this.respond(
             stream,
-            { ":status": rejection.status, "apns-id": apnsId, "content-type": "application/json" },
+            { ":status": rejection.status, [idHeader]: id, "content-type": "application/json" },
             JSON.stringify({
               reason: rejection.reason,
               ...(expiration ? { timestamp: expiration.getTime() } : {}),

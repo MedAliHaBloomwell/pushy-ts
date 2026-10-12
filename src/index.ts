@@ -1,6 +1,26 @@
+export { ApnsHttp2Client, type ApnsHttp2ClientOptions } from "./base-client";
 export { ApnsClient, type ApnsClientCredentials, type ApnsClientOptions } from "./client";
 export { ApnsClientBuilder } from "./client-builder";
-export type { SocketFactory } from "./connection";
+export type { ApnsTlsOverrides, ApnsTlsOverridesProvider, SocketFactory } from "./connection";
+export {
+  ApnsChannelManagementClient,
+  ChannelManagementError,
+  MessageStoragePolicy,
+  type ApnsChannelManagementClientOptions,
+  type ChannelConfiguration,
+  type ChannelManagementRequestOptions,
+  type CreatedChannel,
+} from "./channel-management";
+export {
+  LIVE_ACTIVITY_TOPIC_SUFFIX,
+  LiveActivityPayloadBuilder,
+  LiveActivityPushNotification,
+  liveActivityTopic,
+  type ApnsBroadcastNotification,
+  type BroadcastNotificationResponse,
+  type LiveActivityAlertText,
+  type LiveActivityPriority,
+} from "./live-activity";
 export {
   ALTERNATE_APNS_PORT,
   DEFAULT_APNS_PORT,
@@ -8,7 +28,11 @@ export {
   DEFAULT_EXPIRATION_PERIOD_MS,
   DEFAULT_TOKEN_EXPIRATION_MS,
   DEVELOPMENT_APNS_HOST,
+  DEVELOPMENT_CHANNEL_MANAGEMENT_HOST,
+  DEVELOPMENT_CHANNEL_MANAGEMENT_PORT,
   PRODUCTION_APNS_HOST,
+  PRODUCTION_CHANNEL_MANAGEMENT_HOST,
+  PRODUCTION_CHANNEL_MANAGEMENT_PORT,
 } from "./constants";
 export {
   ApnsError,

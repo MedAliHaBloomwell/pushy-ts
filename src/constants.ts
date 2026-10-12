@@ -13,6 +13,18 @@ export const DEFAULT_APNS_PORT = 443;
  */
 export const ALTERNATE_APNS_PORT = 2197;
 
+/** The development host for managing broadcast channels (Live Activities, iOS 18+). */
+export const DEVELOPMENT_CHANNEL_MANAGEMENT_HOST = "api-manage-broadcast.sandbox.push.apple.com";
+
+/** The port of {@link DEVELOPMENT_CHANNEL_MANAGEMENT_HOST}. */
+export const DEVELOPMENT_CHANNEL_MANAGEMENT_PORT = 2195;
+
+/** The production host for managing broadcast channels (Live Activities, iOS 18+). */
+export const PRODUCTION_CHANNEL_MANAGEMENT_HOST = "api-manage-broadcast.push.apple.com";
+
+/** The port of {@link PRODUCTION_CHANNEL_MANAGEMENT_HOST}. */
+export const PRODUCTION_CHANNEL_MANAGEMENT_PORT = 2196;
+
 /** The default idle time, in milliseconds, after which a client closes a connection (which may be reopened later). */
 export const DEFAULT_CLOSE_AFTER_IDLE_MS = 60_000;
 

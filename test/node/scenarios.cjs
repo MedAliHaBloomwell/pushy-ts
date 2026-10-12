@@ -23,6 +23,11 @@ function defineScenarios(lib, { describe, test, after }) {
     ApnsVerificationKey,
     ConnectionTimeoutError,
     ClientClosedError,
+    ApnsChannelManagementClient,
+    LiveActivityEvent,
+    LiveActivityPayloadBuilder,
+    LiveActivityPushNotification,
+    MessageStoragePolicy,
     MockApnsServer,
     PushType,
     ValidatingPushNotificationHandlerFactory,
@@ -37,6 +42,8 @@ function defineScenarios(lib, { describe, test, after }) {
     for (const cleanup of cleanups.reverse()) await cleanup();
   });
 
+  const channelId = Buffer.from("node-e2e-channel").toString("base64");
+
   async function startMockServer() {
     const server = new MockApnsServer({
       serverCredentials: { cert: fixture("server.pem"), key: fixture("server.key") },
@@ -44,6 +51,7 @@ function defineScenarios(lib, { describe, test, after }) {
       handlerFactory: new ValidatingPushNotificationHandlerFactory({
         deviceTokensByTopic: { [TOPIC]: [deviceToken] },
         verificationKeys: [{ key: ApnsVerificationKey.fromSigningKey(signingKey), topics: [TOPIC] }],
+        broadcastChannels: [{ bundleId: TOPIC, channelId }],
       }),
     });
     const port = await server.start(0, "127.0.0.1");
@@ -103,6 +111,53 @@ function defineScenarios(lib, { describe, test, after }) {
       const response = await client.sendNotification({ token: deviceToken, topic: TOPIC, payload });
       assert.equal(response.accepted, true);
       assert.equal(requests, 2);
+    });
+
+    test("Live Activity notifications, broadcasts and channels", async () => {
+      const port = await startMockServer();
+      const lookups = [];
+      const client = newClient({
+        port,
+        signingKey,
+        tlsOptions: () => ({
+          lookup: (hostname, options, callback) => {
+            lookups.push(hostname);
+            require("node:dns").lookup(hostname, options, callback);
+          },
+        }),
+      });
+      const update = new LiveActivityPayloadBuilder()
+        .setEvent(LiveActivityEvent.UPDATE)
+        .setContentState({ homeScore: 1, awayScore: 0 })
+        .setLocalizedAlertTitle("GOAL_%@", "Home")
+        .build();
+
+      const pushed = await client.sendNotification(new LiveActivityPushNotification(deviceToken, TOPIC, update));
+      assert.equal(pushed.accepted, true);
+
+      const broadcast = await client.sendBroadcastNotification({ bundleId: TOPIC, channelId, payload: update });
+      assert.equal(broadcast.accepted, true);
+      assert.ok(broadcast.apnsUniqueId);
+      assert.deepEqual(lookups, ["localhost"]);
+
+      const { startChannelManagementServer } = await import("../support/channel-management-server.mjs");
+      const fake = await startChannelManagementServer({ cert: fixture("server.pem"), key: fixture("server.key") });
+      cleanups.push(() => fake.close());
+      const channels = new ApnsChannelManagementClient({
+        host: "localhost",
+        port: fake.port,
+        signingKey,
+        trustedServerCertificates: fixture("ca.pem"),
+      });
+      cleanups.push(() => channels.close());
+
+      const created = await channels.createChannel(TOPIC, {
+        messageStoragePolicy: MessageStoragePolicy.NO_MESSAGE_STORED,
+      });
+      assert.deepEqual((await channels.listChannels(TOPIC)).channels, [created.channelId]);
+      assert.equal((await channels.readChannel(TOPIC, created.channelId)).messageStoragePolicy, 0);
+      await channels.deleteChannel(TOPIC, created.channelId);
+      assert.deepEqual((await channels.listChannels(TOPIC)).channels, []);
     });
 
     test("HTTP CONNECT proxy", async () => {
