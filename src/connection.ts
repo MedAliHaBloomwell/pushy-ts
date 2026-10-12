@@ -121,9 +121,11 @@ export class ApnsConnection {
       // The connection owns its TLS socket rather than letting http2.connect create one: destroying a session that is
       // still handshaking does not reliably close the underlying socket (in Node or Bun), but destroying the socket
       // does.
+      // autoSelectFamily ("Happy Eyeballs") is the default from Node 20; enabling it keeps dual-stack hosts reachable
+      // on Node 18 when the first address family returned by DNS does not work.
       const socket = tls.connect({
         ...tlsOptions,
-        ...(rawSocket ? { socket: rawSocket } : { host, port }),
+        ...(rawSocket ? { socket: rawSocket } : { host, port, autoSelectFamily: true }),
         ALPNProtocols: ["h2"],
       });
       tlsSocket = socket;
